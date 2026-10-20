@@ -1,6 +1,47 @@
 import { createProviderAdapterLogger, DnsAdapter, DnsRecord, DomainInfo, PageResult, asArray, BaseAdapter, Dict, normalizeRrName, resolveDomainIdHelper, safeString, toNumber, toRecordStatus, uuid, fetchWithFallback } from '../internal';
 import crypto from 'node:crypto';
 
+// 华为云DNS记录集格式
+interface BaseHWRecordSet {
+  id: string;
+  name: string;
+  description: string;
+  type: string;
+  ttl: number;
+  records: string[];
+  line: string;
+}
+
+// 查询接口返回的记录集格式
+// @see https://support.huaweicloud.com/api-dns/dns_api_64002.html
+interface GetHWRecordSet extends BaseHWRecordSet {
+  zone_id: string;
+  zone_name: string;
+  created_at: string;
+  updated_at: string;
+  status: string;
+  default: boolean;
+  weight: number;
+}
+
+// 一条记录集可能包含多个记录
+const MULTI_RECORD_TYPES = ['MX', 'NS'];
+const MULTI_RECORD_SEPARATOR = '$';
+
+function getRealRecordId(recordId: string): string {
+  if (!recordId.includes(MULTI_RECORD_SEPARATOR)) {
+    return recordId;
+  }
+  return recordId.substring(0, recordId.lastIndexOf(MULTI_RECORD_SEPARATOR));
+}
+function getRecordIndex(recordId: string): number {
+  if (!recordId.includes(MULTI_RECORD_SEPARATOR)) {
+    return -1;
+  }
+  return Number(recordId.substring(recordId.lastIndexOf(MULTI_RECORD_SEPARATOR) + 1));
+}
+
+
 const log = createProviderAdapterLogger('Huawei');
 class HuaweiCloudClient {
   private readonly useProxy: boolean;
@@ -235,11 +276,11 @@ export class HuaweiAdapter extends BaseAdapter {
       }
 
       const data = await this.client.request<{
-        recordsets: Dict[];
+        recordsets: GetHWRecordSet[];
         metadata: { total_count: number };
       }>('GET', `/v2.1/zones/${domainId}/recordsets`, query);
 
-      const list = (data.recordsets || []).map((row) => this.mapRecord(row));
+      const list = (data.recordsets || []).map((row) => this.mapRecord(row)).flat();
       return { total: data.metadata?.total_count || list.length, list };
     } catch (e) {
       this.error = e instanceof Error ? e.message : String(e);
@@ -247,19 +288,34 @@ export class HuaweiAdapter extends BaseAdapter {
     }
   }
 
-  async getDomainRecordInfo(recordId: string): Promise<DnsRecord | null> {
+  private async getRawRecord(recordId: string): Promise<GetHWRecordSet | null> {
     try {
       const domainId = await this.resolveDomainId();
       if (!domainId) {
         return null;
       }
-
-      const data = await this.client.request<Dict>('GET', `/v2.1/zones/${domainId}/recordsets/${recordId}`);
-      return this.mapRecord(data);
+      return await this.client.request<GetHWRecordSet>('GET', `/v2.1/zones/${domainId}/recordsets/${recordId}`);
     } catch (e) {
       this.error = e instanceof Error ? e.message : String(e);
       return null;
     }
+  }
+
+  async getDomainRecordInfo(recordId: string): Promise<DnsRecord | null> {
+    try {
+      const data = await this.getRawRecord(getRealRecordId(recordId));
+      if (!data) {
+        return null;
+      }
+      return this.mapRecord(data)[0];
+    } catch (e) {
+      this.error = e instanceof Error ? e.message : String(e);
+      return null;
+    }
+  }
+
+  getRecordTypes() {
+    return ['A', 'AAAA', 'MX', 'CNAME', 'TXT', 'SRV', 'NS', 'SOA', 'CAA'];
   }
 
   async addDomainRecord(
@@ -268,7 +324,7 @@ export class HuaweiAdapter extends BaseAdapter {
     value: string,
     line?: string,
     ttl = 600,
-    _mx?: number,
+    mx?: number,
     weight?: number,
     remark?: string
   ): Promise<string | null> {
@@ -283,6 +339,9 @@ export class HuaweiAdapter extends BaseAdapter {
       if (type === 'TXT' && !recordValue.startsWith('"')) {
         recordValue = `"${recordValue}"`;
       }
+      if (type === 'MX' && typeof value !== 'undefined' && typeof mx !== 'undefined') {
+        recordValue = `${mx} ${recordValue}`;
+      }
       const records = recordValue.split(',').reverse();
 
       const body: Dict = {
@@ -296,6 +355,30 @@ export class HuaweiAdapter extends BaseAdapter {
 
       if (weight && weight > 0) {
         body.weight = weight;
+      }
+
+      // 华为云NS记录和MX记录支持在同一个“记录集”中录入多条，因此检查是否存在相同的记录集，有的话优先更新
+      if (type === 'NS' || type === 'MX') {
+        const existingRecordSet = await this.getDomainRecords(1, 1, undefined, name, undefined, type, line);
+        if (existingRecordSet.list.length > 0) {
+          const rec = existingRecordSet.list[0];
+          if (existingRecordSet.list.length > 1) {
+            await this.updateDomainRecord(
+              `${getRealRecordId(rec.RecordId)}${MULTI_RECORD_SEPARATOR}${existingRecordSet.list.length + 1}`,
+              name,
+              type,
+              recordValue,
+              line,
+              ttl,
+              mx,
+              weight,
+              remark
+            );
+          } else {
+            await this.updateDomainRecord(`${getRealRecordId(rec.RecordId)}${MULTI_RECORD_SEPARATOR}1`, name, type, recordValue, line, ttl, mx, weight, remark);
+          }
+          return getRealRecordId(rec.RecordId);
+        }
       }
 
       const data = await this.client.request<{ id: string }>(
@@ -317,10 +400,10 @@ export class HuaweiAdapter extends BaseAdapter {
     recordId: string,
     name: string,
     type: string,
-    value: string,
-    line?: string,
+    value?: string,
+    _line?: string,
     ttl = 600,
-    _mx?: number,
+    mx?: number,
     weight?: number,
     remark?: string
   ): Promise<boolean> {
@@ -331,11 +414,34 @@ export class HuaweiAdapter extends BaseAdapter {
       }
 
       const hostName = this.getHost(name);
-      let recordValue = value;
+      let recordValue = value || '';
       if (type === 'TXT' && !recordValue.startsWith('"')) {
         recordValue = `"${recordValue}"`;
       }
-      const records = recordValue.split(',').reverse();
+      if (type === 'MX' && typeof value !== 'undefined' && typeof mx !== 'undefined') {
+        recordValue = `${mx} ${recordValue}`;
+      }
+
+      let putRecordId = recordId;
+
+      let records: string[];
+      if (recordId.includes(MULTI_RECORD_SEPARATOR)) {
+        const index = getRecordIndex(recordId);
+        putRecordId = getRealRecordId(recordId);
+        // 取出目前的完整记录
+        const data = await this.getRawRecord(putRecordId);
+        if (!data) {
+          throw new Error(`Record ${putRecordId} not found`);
+        }
+        records = [...data.records];
+        if (typeof value === 'undefined') {
+          records.splice(index, 1);
+        } else {
+          records[index] = recordValue;
+        }
+      } else {
+        records = [recordValue];
+      }
 
       const body: Dict = {
         name: hostName,
@@ -349,7 +455,7 @@ export class HuaweiAdapter extends BaseAdapter {
         body.weight = weight;
       }
 
-      await this.client.request('PUT', `/v2.1/zones/${domainId}/recordsets/${recordId}`, null, body);
+      await this.client.request('PUT', `/v2.1/zones/${domainId}/recordsets/${putRecordId}`, null, body);
       return true;
     } catch (e) {
       this.error = e instanceof Error ? e.message : String(e);
@@ -363,6 +469,17 @@ export class HuaweiAdapter extends BaseAdapter {
       if (!domainId) {
         return false;
       }
+      
+      if (recordId.includes(MULTI_RECORD_SEPARATOR)) {
+        const currentRec = await this.getRawRecord(getRealRecordId(recordId));
+        if (!currentRec) {
+          throw new Error(`Record ${recordId} not found`);
+        }
+        if (currentRec.records.length > 1) {
+          await this.updateDomainRecord(recordId, currentRec.name, currentRec.type, undefined, undefined, undefined, undefined, undefined);
+          return true;
+        }
+      }
 
       await this.client.request('DELETE', `/v2.1/zones/${domainId}/recordsets/${recordId}`);
       return true;
@@ -375,7 +492,7 @@ export class HuaweiAdapter extends BaseAdapter {
   async setDomainRecordStatus(recordId: string, status: number): Promise<boolean> {
     try {
       const body = { status: status === 1 ? 'ENABLE' : 'DISABLE' };
-      await this.client.request('PUT', `/v2.1/recordsets/${recordId}/statuses/set`, null, body);
+      await this.client.request('PUT', `/v2.1/recordsets/${getRealRecordId(recordId)}/statuses/set`, null, body);
       return true;
     } catch (e) {
       this.error = e instanceof Error ? e.message : String(e);
@@ -427,7 +544,7 @@ export class HuaweiAdapter extends BaseAdapter {
     return `${name}.${this.config.domain}.`;
   }
 
-  private mapRecord(row: Dict): DnsRecord {
+  private mapRecord(row: GetHWRecordSet): DnsRecord[] {
     const domain = this.config.domain || '';
     const zoneName = safeString(row.zone_name);
     let name = '';
@@ -438,19 +555,36 @@ export class HuaweiAdapter extends BaseAdapter {
       name = recordName.replace(`.${zoneName}.`, '');
     }
 
-    return {
+    const baseRecord: DnsRecord = {
       RecordId: safeString(row.id),
       Domain: zoneName.replace(/\.$/, ''),
       Name: name,
       Type: safeString(row.type),
-      Value: Array.isArray(row.records) ? row.records.join(',') : safeString(row.records),
+      Value: '',
       Line: safeString(row.line) || '0',
       TTL: toNumber(row.ttl, 600),
-      MX: row.mx ? toNumber(row.mx, 0) : 0,
+      MX: 0,
       Status: row.status === 'ACTIVE' ? 1 : 0,
       Weight: row.weight ? toNumber(row.weight, 0) : undefined,
       Remark: safeString(row.description) || undefined,
       UpdateTime: safeString(row.updated_at) || undefined,
     };
+
+    if (MULTI_RECORD_TYPES.includes(row.type) && Array.isArray(row.records)) {
+      return row.records.map((record, index) => {
+        const mx = row.type === 'MX' ? toNumber(record.substring(0, record.indexOf(' ')), 0) : 0;
+        return {
+          ...baseRecord,
+          RecordId: `${safeString(row.id)}${MULTI_RECORD_SEPARATOR}${index}`,
+          Value: record,
+          MX: mx,
+        }
+      });
+    }
+
+    return [{
+      ...baseRecord,
+      Value: row.records ? row.records.join(',') : safeString(row.records),
+    }];
   }
 }
